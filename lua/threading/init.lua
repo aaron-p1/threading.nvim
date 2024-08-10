@@ -11,62 +11,140 @@ local uv = vim.uv
 ---@field ctrl_read_pipe uv_pipe_t
 ---@field ctrl_write_pipe uv_pipe_t
 
----@class VimFunction
----@field functions string[]
+---@class VimCall
+---@field keys string[]
 ---@field args any[]
 
----run vim function based on data
----@param data VimFunction
-local function handle_vim(data)
-  local fn = vim.iter(data.functions):fold(vim, function(acc, v)
-    return acc and acc[v] or nil
-  end)
+---@class VimGet
+---@field keys string[]
 
-  if fn then
-    return fn(unpack(data.args))
+---@class VimAssign
+---@field keys string[]
+---@field value any
+
+local disabled_types = {
+  ["vim"] = { "uv", "loop" }
+}
+
+---get data types of table
+---@param entry table
+---@param prefix string
+---@param limit integer
+---@return table
+local function get_types(entry, prefix, limit)
+  local result = {}
+
+  for k, v in pairs(entry) do
+    if disabled_types[prefix] and vim.tbl_contains(disabled_types[prefix], k) then
+      goto continue
+    end
+
+    local ktype = type(v)
+    result[k] = ktype
+
+    if ktype == "table" and limit > 0 then
+      if not result.subtypes then
+        result.subtypes = {}
+      end
+
+      result.subtypes[k] = get_types(v, string.format("%s.%s", prefix, k), limit - 1)
+    end
+
+    ::continue::
+  end
+
+  return result
+end
+
+M._vim_types = get_types(vim, "vim", 2)
+
+---get a vim key depending on keys
+---@param keys string[]
+---@param skipend boolean?
+---@return any
+local function get_vim_key(keys, skipend)
+  return vim.iter(keys)
+      :rskip(skipend and 1 or 0)
+      :fold(vim, function(acc, v)
+        if acc == nil then
+          return nil
+        end
+
+        -- TODO handle error
+        return acc[v]
+      end)
+end
+
+---run vim function based on data
+---@param data VimCall
+---@return any
+local function handle_vim_call(data)
+  local value = get_vim_key(data.keys)
+
+  if value == nil then
+    print("Could not find value to assign to", vim.inspect(data))
+  else
+    return value(unpack(data.args))
+  end
+end
+
+---get a vim key depending on keys
+---@param data VimGet
+local function handle_vim_get(data)
+  return get_vim_key(data.keys)
+end
+
+---assign a value to a vim variable
+---@param data VimAssign
+local function handle_vim_set(data)
+  local value = get_vim_key(data.keys, true)
+
+  if value == nil then
+    print("Could not find value to assign to", vim.inspect(data))
+  else
+    value[data.keys[#data.keys]] = data.value
   end
 end
 
 ---return on_control
 ---@param ctrl_write_pipe uv_pipe_t
----@return function(err: string, data: string)
+---@return fun(err: string, data: string)
 local function get_on_control(ctrl_write_pipe)
-  return function(err, data)
-    util.debug("m", err, data)
-
-    if data == nil then
-      util.debug("Thread closed control")
-    elseif data then
-      local ok, data_table = pcall(vim.mpack.decode, data)
-
-      if not ok or type(data_table) ~= "table" then
-        print("Failed to decode data: ", data)
-        return
-      end
-
-      if data_table.type == "vim" then
+  return util.dechunk_pipe_msg(
+    function(data)
+      if data.type == "vim" then
         vim.schedule(function()
-          -- TODO handle error
-          local result = handle_vim(data_table)
+          local result
 
-          ctrl_write_pipe:write(vim.mpack.encode({ type = "vim_response", result = result }))
+          -- TODO handle errors
+          if data.kind == "call" then
+            result = handle_vim_call(data)
+          elseif data.kind == "get" then
+            result = handle_vim_get(data)
+          elseif data.kind == "set" then
+            result = handle_vim_set(data)
+          else
+            print("Unknown kind: ", data.kind)
+          end
+
+          util.write_to_pipe(ctrl_write_pipe, {
+            type = "vim_response",
+            result = result
+          })
         end)
       end
+    end,
+    function(err)
+      print("Error in control pipe: ", err)
     end
-  end
+  )
 end
 
 ---returns config for thread
 ---@return table
 local function get_config()
-  local vim_types = {}
-
-  for k, v in pairs(vim) do
-    vim_types[k] = type(v)
-  end
-
   return {
-    vim_types = vim_types,
+    vim_types = M._vim_types
   }
 end
 
