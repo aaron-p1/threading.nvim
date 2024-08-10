@@ -6,7 +6,7 @@ local uv = vim.uv
 
 _G._vim = vim
 
-local function stop_thread()
+function _vim.stop_thread()
   util.debug("Stopping thread")
   uv.stop()
 end
@@ -129,8 +129,6 @@ end
 ---@param ctrl_write_pipe uv_pipe_t
 ---@param config table
 local function init_vim(ctrl_write_pipe, config)
-  _vim.stop_thread = stop_thread
-
   _G.vim = get_override_table(ctrl_write_pipe, _vim, config.vim_types)
 end
 
@@ -157,6 +155,9 @@ local function get_on_control(co)
     end,
     function(err)
       print("Error in control pipe in thread: ", err)
+    end,
+    function()
+      _vim.stop_thread()
     end
   )
 end
@@ -166,13 +167,14 @@ end
 ---@param read_fd integer
 ---@param cb_string string
 ---@param config string
----@param ... any -- TODO handle table
-function M.run(write_fd, read_fd, cb_string, config, ...)
+---@param arg_str string
+---@param arg_len integer
+function M.run(write_fd, read_fd, cb_string, config, arg_str, arg_len)
   util.debug("Starting thread")
 
   local config_table = _vim.mpack.decode(config)
 
-  local args = { ... }
+  local args = _vim.mpack.decode(arg_str)
 
   local ctrl_write_pipe = util.open_fd(write_fd)
   local ctrl_read_pipe = util.open_fd(read_fd)
@@ -182,7 +184,7 @@ function M.run(write_fd, read_fd, cb_string, config, ...)
   local co = coroutine.create(function()
     local fn, err = loadstring(cb_string)
     assert(fn, "Failed to load string: " .. (err or ""))
-    fn(unpack(args))
+    fn(unpack(args, 1, arg_len))
   end)
 
   ctrl_read_pipe:read_start(get_on_control(co))

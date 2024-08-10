@@ -10,6 +10,8 @@ local uv = vim.uv
 ---@field thread uv_thread
 ---@field ctrl_read_pipe uv_pipe_t
 ---@field ctrl_write_pipe uv_pipe_t
+---@field stop fun()
+---@field is_running fun(): boolean
 
 ---@class VimCall
 ---@field keys string[]
@@ -107,9 +109,9 @@ local function handle_vim_set(data)
 end
 
 ---return on_control
----@param ctrl_write_pipe uv_pipe_t
+---@param thread ThreadingThread
 ---@return fun(err: string, data: string)
-local function get_on_control(ctrl_write_pipe)
+local function get_on_control(thread)
   return util.dechunk_pipe_msg(
     function(data)
       if data.type == "vim" then
@@ -127,7 +129,7 @@ local function get_on_control(ctrl_write_pipe)
             print("Unknown kind: ", data.kind)
           end
 
-          util.write_to_pipe(ctrl_write_pipe, {
+          util.write_to_pipe(thread.ctrl_write_pipe, {
             type = "vim_response",
             result = result
           })
@@ -136,6 +138,9 @@ local function get_on_control(ctrl_write_pipe)
     end,
     function(err)
       print("Error in control pipe: ", err)
+    end,
+    function()
+      thread:stop()
     end
   )
 end
@@ -159,27 +164,49 @@ function M.start(callback, ...)
   local ctrl_read_pipe = util.open_fd(ctrl_to_main.read)
   local ctrl_write_pipe = util.open_fd(ctrl_to_thread.write)
 
-  ctrl_read_pipe:read_start(get_on_control(ctrl_write_pipe))
-
   local cb_string = string.dump(callback)
   local config = vim.mpack.encode(get_config())
 
+  -- TODO handle functions
+  local args = { ... }
+  local arg_str = vim.mpack.encode(args)
+  local arg_len = util.find_max_index(args)
+
   local thread = uv.new_thread(function(...)
     require("threading.thread").run(...)
-  end, ctrl_to_main.write, ctrl_to_thread.read, cb_string, config, ...)
+  end, ctrl_to_main.write, ctrl_to_thread.read, cb_string, config, arg_str, arg_len)
 
-  return {
+  ---@type ThreadingThread
+  local result_thread = {
     thread = thread,
     ctrl_read_pipe = ctrl_read_pipe,
     ctrl_write_pipe = ctrl_write_pipe,
+    stop = M.stop,
+    is_running = M.is_running
   }
+
+  ctrl_read_pipe:read_start(get_on_control(result_thread))
+
+  return result_thread
 end
 
 ---stop a thread by sending a stop message
 ---@param thread ThreadingThread
 function M.stop(thread)
-  thread.ctrl_read_pipe:close()
-  thread.ctrl_write_pipe:close()
+  if thread.ctrl_read_pipe:is_active() then
+    thread.ctrl_read_pipe:close()
+  end
+
+  if thread.ctrl_write_pipe:is_active() then
+    thread.ctrl_write_pipe:close()
+  end
+end
+
+---check if a thread is running
+---@param thread ThreadingThread
+---@return boolean
+function M.is_running(thread)
+  return thread.ctrl_read_pipe:is_active() or thread.ctrl_write_pipe:is_active()
 end
 
 return M

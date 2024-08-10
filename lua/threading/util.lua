@@ -42,6 +42,16 @@ function M.fappend(tbl, value)
   return new_tbl
 end
 
+function M.find_max_index(tbl)
+    local max_index = 0
+    for index, _ in pairs(tbl) do
+        if type(index) == "number" and index > max_index then
+            max_index = index
+        end
+    end
+    return max_index
+end
+
 ---open a fd in new pipe
 ---@param fd integer
 ---@return uv_pipe_t
@@ -65,8 +75,9 @@ end
 ---dechunk control messages
 ---@param cb fun(data: table)
 ---@param err_cb fun(err: string)
+---@param closing_cb function?
 ---@return fun(err: string, data: string)
-function M.dechunk_pipe_msg(cb, err_cb)
+function M.dechunk_pipe_msg(cb, err_cb, closing_cb)
   local prev_data = ""
 
   return function(err, data)
@@ -77,6 +88,9 @@ function M.dechunk_pipe_msg(cb, err_cb)
 
     if data == nil then
       M.debug("Pipe closed")
+      if closing_cb then
+        closing_cb()
+      end
     else
       local all_data = prev_data .. data
 

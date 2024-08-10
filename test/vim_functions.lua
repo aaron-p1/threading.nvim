@@ -18,12 +18,16 @@ end
 
 print("------------ Starting tests")
 
-local function tests()
+local function tests(first, second, third)
   local function check(cond, msg)
     print(msg .. ":", cond)
     assert(cond, msg)
     print("--- Passed")
   end
+
+  check(first == "first", "First argument is 'first'")
+  check(second == nil, "Second argument is nil")
+  check(third.test == "table", "Third argument is table")
 
   check(vim.api.nvim_get_current_buf(), "Read current bufnum")
 
@@ -60,4 +64,4 @@ local function tests()
   vim.stop_thread()
 end
 
-_G.Thread = t.start(tests)
+_G.Thread = t.start(tests, "first", nil, { test = "table" })

@@ -38,14 +38,13 @@ really need them.
 - a way to communicate with the thread
 - stop all threads when neovim is closed
 - maybe add option to let the thread terminate if function ends
-- handle starting parameters
 
 ## Usage
 
 ```lua
 local t = require("threading")
 
-local thread = t.start(function()
+local thread = t.start(function(param1, param2)
   -- should not block the main thread
   vim.uv.sleep(5000)
 
@@ -53,7 +52,7 @@ local thread = t.start(function()
   print(vim.api.nvim_get_current_buf())
 
   -- thread keeps running after the function is done
-end)
+end, "param1", "param2")
 
 -- can be stopped with this but it is not needed in most cases
 -- note: this stops the thread after fully executing the function
