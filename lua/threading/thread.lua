@@ -1,3 +1,6 @@
+-- this file is not executed in the main thread
+-- global variables are not shared between threads
+
 local util = require("threading.util")
 
 local M = {}
@@ -6,11 +9,28 @@ local uv = vim.uv
 
 _G._vim = vim
 
+---@type table<integer, function> functions that were sent to the main thread. The key is the id
+local sent_functions = {}
+local function_id_counter = 0
+
 function _vim.stop_thread()
   util.debug("Stopping thread")
   uv.stop()
 end
 
+---make data serializable and saves original
+---@param data any
+---@return any
+local function to_serializable(data)
+  local sdata
+  sdata, sent_functions, function_id_counter = util.to_serializable(data, function_id_counter, sent_functions)
+  return sdata
+end
+
+---returns a function that calls a vim function on the main thread
+---@param ctrl_write_pipe uv_pipe_t
+---@param keys string[]
+---@return function
 local function get_call_to_main(ctrl_write_pipe, keys)
   return function(...)
     util.debug("Calling", keys, ...)
@@ -19,16 +39,21 @@ local function get_call_to_main(ctrl_write_pipe, keys)
       type = "vim",
       kind = "call",
       keys = keys,
-      args = { ... }
+      args = to_serializable({ ... })
     })
 
     return coroutine.yield()
   end
 end
 
+---get a vim variable from the main thread
+---@param ctrl_write_pipe uv_pipe_t
+---@param keys string[]
+---@return any
 local function get_data_from_main(ctrl_write_pipe, keys)
   util.debug("Getting", keys)
 
+  -- TODO handle tables as keys (should be converted to "table: 0x...")
   util.write_to_pipe(ctrl_write_pipe, {
     type = "vim",
     kind = "get",
@@ -38,6 +63,11 @@ local function get_data_from_main(ctrl_write_pipe, keys)
   return coroutine.yield()
 end
 
+---assigns a value to a vim variable on the main thread
+---@param ctrl_write_pipe uv_pipe_t
+---@param keys string[]
+---@param value any
+---@return any
 local function assign_data_to_main(ctrl_write_pipe, keys, value)
   util.debug("Assigning", keys, value)
 
@@ -45,7 +75,7 @@ local function assign_data_to_main(ctrl_write_pipe, keys, value)
     type = "vim",
     kind = "set",
     keys = keys,
-    value = value
+    value = to_serializable(value)
   })
 
   return coroutine.yield()
@@ -66,6 +96,12 @@ local function get_old_key(old, key)
   return result
 end
 
+---returns a metatable that proxies unknown keys of `old` to the main thread
+---@param ctrl_write_pipe uv_pipe_t
+---@param old table?
+---@param types table
+---@param prev_keys string[]?
+---@return table
 local function get_override_table(ctrl_write_pipe, old, types, prev_keys)
   old = old or {}
   prev_keys = prev_keys or {}
@@ -88,12 +124,33 @@ local function get_override_table(ctrl_write_pipe, old, types, prev_keys)
       elseif types[key] == "table" and types.subtypes[key] then
         local old_value = get_old_key(old, key)
 
+        if type(old_value) == "function" then
+          return old_value
+        end
+
         return get_override_table(
           ctrl_write_pipe,
           old_value,
-          types.subtypes[key],
+          types[key] == nil and {} or types.subtypes[key],
           util.fappend(prev_keys, key)
         )
+      elseif types[key] == nil then
+        -- TODO make all of this dynamic when implementing sendable metatables
+        local value_keys = {"o"}
+        local function_keys = {"fn", "cmd"}
+
+        if _vim.tbl_contains(value_keys, prev_keys[1]) then
+          return get_data_from_main(ctrl_write_pipe, util.fappend(prev_keys, key))
+        elseif _vim.tbl_contains(function_keys, prev_keys[1]) then
+          return get_override_table(ctrl_write_pipe, get_old_key(old, key), {}, util.fappend(prev_keys, key))
+        end
+
+        local old_value = get_old_key(old, key)
+        if old_value then
+          return old_value
+        end
+
+        error("Unknown key: " .. table.concat(prev_keys, ".") .. "." .. key)
       else
         local old_value = get_old_key(old, key)
         if old_value then
@@ -115,6 +172,11 @@ local function get_override_table(ctrl_write_pipe, old, types, prev_keys)
     end,
     __call = function(_, ...)
       if is_in_interal then
+        return old(...)
+      end
+
+      local mt = getmetatable(old)
+      if mt and type(mt.__call) == "function" then
         return old(...)
       end
 
@@ -143,14 +205,43 @@ local function resume(...)
 end
 
 ---return on_control
+---@param ctrl_write_pipe uv_pipe_t
 ---@param co thread
 ---@return fun(err: string, data: string)
-local function get_on_control(co)
+local function get_on_control(ctrl_write_pipe, co)
   return util.dechunk_pipe_msg(
     function(data)
       if data.type == "vim_response" then
         util.debug("Received vim_response:", data.result)
         resume(co, data.result)
+      elseif data.type == "upvalues" then
+        util.debug("Received upvalues:", data)
+        local fn = sent_functions[data.id]
+        assert(fn, "Could not find fn with id: " .. data.id .. " in " .. _vim.inspect(sent_functions))
+
+        for index, value in pairs(data.upvalues) do
+          -- TODO make dynamic
+          if type(value) == "table" and value.___serialized_type == "function_ref" then
+            value = sent_functions[value.id]
+            assert(value, "Could not find sent_function with")
+          end
+
+          debug.setupvalue(fn, index, value)
+        end
+      elseif data.type == "delete" then
+        if data.kind == "function" then
+          util.debug("Deleting function with id:", data.id)
+
+          assert(sent_functions[data.id],
+            "Could not find fn with id: " .. data.id .. " in " .. _vim.inspect(sent_functions))
+          sent_functions[data.id] = nil
+
+          util.write_to_pipe(ctrl_write_pipe, {
+            type = "delete_response",
+            kind = "function",
+            id = data.id
+          })
+        end
       end
     end,
     function(err)
@@ -173,6 +264,7 @@ function M.run(write_fd, read_fd, cb_string, config, arg_str, arg_len)
   util.debug("Starting thread")
 
   local config_table = _vim.mpack.decode(config)
+  util.print_debug = config_table.debug or false
 
   local args = _vim.mpack.decode(arg_str)
 
@@ -184,10 +276,11 @@ function M.run(write_fd, read_fd, cb_string, config, arg_str, arg_len)
   local co = coroutine.create(function()
     local fn, err = loadstring(cb_string)
     assert(fn, "Failed to load string: " .. (err or ""))
+    -- TODO isolate
     fn(unpack(args, 1, arg_len))
   end)
 
-  ctrl_read_pipe:read_start(get_on_control(co))
+  ctrl_read_pipe:read_start(get_on_control(ctrl_write_pipe, co))
 
   resume(co)
 
