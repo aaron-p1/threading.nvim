@@ -31,6 +31,7 @@ really need them.
 - [x] callbacks as parameters to functions that are sent to the main thread
 - [ ] metatables e.g. `vim.iter`
 - [ ] userdata e.g. for treesitter functions
+- [x] require with calls to main thread work
 
 **Note**: The current implementation of callbacks being sent to the main thread
 needs to track if the callback is garbage collected by lua. This works in most
@@ -45,6 +46,7 @@ notice it.
 ## Additional TODO
 
 - vim function error handling
+- check why so many threads get created when running the tests a single time
 - make accessing vim functions more dynamic so even long chains of keys work
 - a way to communicate with the thread
 - stop all threads when neovim is closed

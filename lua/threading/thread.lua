@@ -8,6 +8,7 @@ local M = {}
 local uv = vim.uv
 
 _G._vim = vim
+_G._require = require
 
 ---@type table<integer, function> functions that were sent to the main thread. The key is the id
 local sent_functions = {}
@@ -136,8 +137,8 @@ local function get_override_table(ctrl_write_pipe, old, types, prev_keys)
         )
       elseif types[key] == nil then
         -- TODO make all of this dynamic when implementing sendable metatables
-        local value_keys = {"o"}
-        local function_keys = {"fn", "cmd"}
+        local value_keys = { "o" }
+        local function_keys = { "fn", "cmd" }
 
         if _vim.tbl_contains(value_keys, prev_keys[1]) then
           return get_data_from_main(ctrl_write_pipe, util.fappend(prev_keys, key))
@@ -187,11 +188,26 @@ local function get_override_table(ctrl_write_pipe, old, types, prev_keys)
   return result
 end
 
----sets up the global `vim` variable
+---sets up the global variables
 ---@param ctrl_write_pipe uv_pipe_t
 ---@param config table
-local function init_vim(ctrl_write_pipe, config)
+local function init_globals(ctrl_write_pipe, config)
   _G.vim = get_override_table(ctrl_write_pipe, _vim, config.vim_types)
+
+  -- the default require uses C code, so imported modules cannot yield on first level
+  -- this should be a reimplementation, but without checking startuptime (probably unnecessary)
+  _G.require = function(module)
+    local data = package.loaded[module]
+    if data then
+      return data
+    end
+
+    local mod_fn = vim._load_package(module)
+    assert(mod_fn, "Failed to load package: " .. module)
+
+    package.loaded[module] = mod_fn()
+    return package.loaded[module]
+  end
 end
 
 ---resumes a coroutine and throws an error if it fails
@@ -271,7 +287,7 @@ function M.run(write_fd, read_fd, cb_string, config, arg_str, arg_len)
   local ctrl_write_pipe = util.open_fd(write_fd)
   local ctrl_read_pipe = util.open_fd(read_fd)
 
-  init_vim(ctrl_write_pipe, config_table)
+  init_globals(ctrl_write_pipe, config_table)
 
   local co = coroutine.create(function()
     local fn, err = loadstring(cb_string)
