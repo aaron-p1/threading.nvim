@@ -32,6 +32,7 @@ really need them.
 - [ ] metatables e.g. `vim.iter`
 - [ ] userdata e.g. for treesitter functions
 - [x] require with calls to main thread work
+- [ ] `vim.run_on_main_thread` function to run a function on the main thread
 
 **Note**: The current implementation of callbacks being sent to the main thread
 needs to track if the callback is garbage collected by lua. This works in most
@@ -46,6 +47,7 @@ notice it.
 ## Additional TODO
 
 - vim function error handling
+- check if coroutines are working
 - check why so many threads get created when running the tests a single time
 - make accessing vim functions more dynamic so even long chains of keys work
 - a way to communicate with the thread
@@ -53,8 +55,7 @@ notice it.
 - maybe add option to let the thread terminate if function ends
 - mutable tables
 - make changing upvalue to a function value work
-- maybe check if a function has a return statement and if not, run it in the
-  child thread
+- `mpack.encode` may fail if data is too large
 
 ## Usage
 

@@ -1,3 +1,4 @@
+---@diagnostic disable: redundant-return-value
 -- open this file in neovim and run `:source %`
 -- may break stuff in neovim, so you may need to restart
 
@@ -32,6 +33,8 @@ local function tests()
   check("Simple functions", function()
     vim.schedule(function()
       print("Simple scheduling")
+      -- the return nil is for not proxying the function
+      return nil
     end)
 
     vim.print("-- If no 'Simple scheduling' is printed, then this test failed")
@@ -47,13 +50,18 @@ local function tests()
 
       vim.defer_fn(function()
         print("Upvalue should be third:", upvalue)
+        return nil
       end, 10)
+
+      return nil
     end)
 
     vim.schedule(function()
       print("Upvalue should be second:", upvalue)
       print("Now changing to: third")
       upvalue = "third"
+
+      return nil
     end)
 
     vim.uv.sleep(20)
@@ -66,15 +74,18 @@ local function tests()
 
     local fn_upvalue = function(prefix)
       print(prefix, upvalue)
+      return nil
     end
 
     vim.schedule(function()
       fn_upvalue("Calling from upvalue function and other upvalue should be first:")
+      return nil
     end)
 
     vim.schedule(function()
       upvalue = "second"
       fn_upvalue("Calling from upvalue function and other upvalue should be second:")
+      return nil
     end)
 
     local a = 10
@@ -92,10 +103,12 @@ local function tests()
 
     vim.schedule(function()
       fn_recursive("First recursive call counting from 10 to 5:", 5)
+      return nil
     end)
 
     vim.schedule(function()
       fn_recursive("Second recursive call counting from 5 to 0:", 0)
+      return nil
     end)
 
     vim.uv.sleep(10)
@@ -103,7 +116,40 @@ local function tests()
     vim.print("-- The messages above must be right to pass")
   end)
 
-  vim.stop_thread()
+  check("Run functions on main thread and child thread", function()
+    assert(vim.is_thread(), "Should be on child thread")
+
+    local upvalue = 1
+
+    vim.schedule(function()
+      print("running in child thread")
+      assert(vim.is_thread(), "Should be on child thread")
+      assert(upvalue == 1, "Upvalue should be 1")
+    end)
+
+    vim.schedule(function()
+      assert(not vim.is_thread(), "Should be on child thread")
+
+      upvalue = 2
+      return nil
+    end)
+
+    vim.schedule(function()
+      assert(upvalue == 2, "Upvalue should be 2 in child thread")
+
+      assert(vim.o.filetype == "lua", "Call to main should work in proxy function")
+    end)
+  end)
 end
 
 _G.Thread = t.start(tests, nil, { debug = tutil.print_debug })
+
+local other_thread = t.start(function()
+  vim.schedule(function()
+    assert(not vim.is_thread(), "No function proxying: Should be on main thread")
+  end)
+end, nil, { debug = tutil.print_debug, proxy_functions = false })
+
+vim.defer_fn(function()
+  t.stop(other_thread)
+end, 1000)

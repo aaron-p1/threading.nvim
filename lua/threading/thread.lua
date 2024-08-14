@@ -10,6 +10,12 @@ local uv = vim.uv
 _G._vim = vim
 _G._require = require
 
+local config = {}
+
+---@type table<integer, thread> active coroutines in this thread. The key is the id
+local active_coroutines = {}
+local co_id_counter = 0
+
 ---@type table<integer, function> functions that were sent to the main thread. The key is the id
 local sent_functions = {}
 local function_id_counter = 0
@@ -24,8 +30,66 @@ end
 ---@return any
 local function to_serializable(data)
   local sdata
-  sdata, sent_functions, function_id_counter = util.to_serializable(data, function_id_counter, sent_functions)
+  sdata, sent_functions, function_id_counter = util.to_serializable(
+    data,
+    function_id_counter,
+    sent_functions,
+    config.proxy_functions
+  )
   return sdata
+end
+
+---resumes a coroutine and checks for errors
+local function resume_check_err(...)
+  local ok, err = coroutine.resume(...)
+
+  if not ok then
+    error(err)
+  end
+end
+
+---resumes a coroutine and deletes dead coroutines from `running_coroutines`
+---@param co_id thread
+---@param ... any
+local function resume(co_id, ...)
+  for id, co in pairs(active_coroutines) do
+    if coroutine.status(co) == "dead" then
+      active_coroutines[id] = nil
+    end
+  end
+
+  local co = active_coroutines[co_id]
+
+  if not co then
+    return
+  end
+
+  resume_check_err(co, ...)
+end
+
+
+---writes to control pipe
+---@param ctrl_write_pipe uv_pipe_t
+---@param waiting_for_response boolean
+---@param data table
+---@return nil
+local function send_ctrl_msg(ctrl_write_pipe, waiting_for_response, data)
+  if waiting_for_response then
+    local found_co_id
+    local running_co = coroutine.running()
+    for id, co in pairs(active_coroutines) do
+      if co == running_co then
+        found_co_id = id
+        break
+      end
+    end
+
+    assert(found_co_id, "Could not find coroutine")
+
+    data.___co_id = found_co_id
+  end
+
+  util.write_to_pipe(ctrl_write_pipe, data)
 end
 
 ---returns a function that calls a vim function on the main thread
@@ -36,7 +100,7 @@ local function get_call_to_main(ctrl_write_pipe, keys)
   return function(...)
     util.debug("Calling", keys, ...)
 
-    util.write_to_pipe(ctrl_write_pipe, {
+    send_ctrl_msg(ctrl_write_pipe, true, {
       type = "vim",
       kind = "call",
       keys = keys,
@@ -55,7 +119,7 @@ local function get_data_from_main(ctrl_write_pipe, keys)
   util.debug("Getting", keys)
 
   -- TODO handle tables as keys (should be converted to "table: 0x...")
-  util.write_to_pipe(ctrl_write_pipe, {
+  send_ctrl_msg(ctrl_write_pipe, true, {
     type = "vim",
     kind = "get",
     keys = keys
@@ -72,13 +136,14 @@ end
 local function assign_data_to_main(ctrl_write_pipe, keys, value)
   util.debug("Assigning", keys, value)
 
-  util.write_to_pipe(ctrl_write_pipe, {
+  send_ctrl_msg(ctrl_write_pipe, true, {
     type = "vim",
     kind = "set",
     keys = keys,
     value = to_serializable(value)
   })
 
+  -- TODO why wait for response
   return coroutine.yield()
 end
 
@@ -190,8 +255,7 @@ end
 
 ---sets up the global variables
 ---@param ctrl_write_pipe uv_pipe_t
----@param config table
-local function init_globals(ctrl_write_pipe, config)
+local function init_globals(ctrl_write_pipe)
   _G.vim = get_override_table(ctrl_write_pipe, _vim, config.vim_types)
 
   -- the default require uses C code, so imported modules cannot yield on first level
@@ -208,28 +272,27 @@ local function init_globals(ctrl_write_pipe, config)
     package.loaded[module] = mod_fn()
     return package.loaded[module]
   end
-end
 
----resumes a coroutine and throws an error if it fails
----@param ... any
-local function resume(...)
-  local ok, err = coroutine.resume(...)
-
-  if not ok then
-    error(err)
+  local old_co_create = coroutine.create
+  _G.coroutine.create = function(fn)
+    local co = old_co_create(fn)
+    co_id_counter = co_id_counter + 1
+    active_coroutines[co_id_counter] = co
+    return co
   end
 end
 
 ---return on_control
 ---@param ctrl_write_pipe uv_pipe_t
----@param co thread
 ---@return fun(err: string, data: string)
-local function get_on_control(ctrl_write_pipe, co)
+local function get_on_control(ctrl_write_pipe)
   return util.dechunk_pipe_msg(
     function(data)
       if data.type == "vim_response" then
         util.debug("Received vim_response:", data.result)
-        resume(co, data.result)
+        assert(data.___co_id, "No co_id in response")
+
+        resume(data.___co_id, unpack(data.result or {}))
       elseif data.type == "upvalues" then
         util.debug("Received upvalues:", data)
         local fn = sent_functions[data.id]
@@ -244,6 +307,20 @@ local function get_on_control(ctrl_write_pipe, co)
 
           debug.setupvalue(fn, index, value)
         end
+      elseif data.type == "proxy_call" then
+        util.debug("Received proxy_call:", data)
+
+        local fn = sent_functions[data.id]
+        assert(fn, "Could not find fn with id: " .. data.id .. " in " .. _vim.inspect(sent_functions))
+
+        local co = coroutine.create(function()
+          fn(unpack(data.args))
+        end)
+
+        -- start new coroutine
+        resume_check_err(co)
+
+        -- no response
       elseif data.type == "delete" then
         if data.kind == "function" then
           util.debug("Deleting function with id:", data.id)
@@ -252,7 +329,7 @@ local function get_on_control(ctrl_write_pipe, co)
             "Could not find fn with id: " .. data.id .. " in " .. _vim.inspect(sent_functions))
           sent_functions[data.id] = nil
 
-          util.write_to_pipe(ctrl_write_pipe, {
+          send_ctrl_msg(ctrl_write_pipe, false, {
             type = "delete_response",
             kind = "function",
             id = data.id
@@ -273,21 +350,21 @@ end
 ---@param write_fd integer
 ---@param read_fd integer
 ---@param cb_string string
----@param config string
+---@param config_str string
 ---@param arg_str string
 ---@param arg_len integer
-function M.run(write_fd, read_fd, cb_string, config, arg_str, arg_len)
-  util.debug("Starting thread")
+function M.run(write_fd, read_fd, cb_string, config_str, arg_str, arg_len)
+  config = _vim.mpack.decode(config_str)
+  util.print_debug = config.debug or false
 
-  local config_table = _vim.mpack.decode(config)
-  util.print_debug = config_table.debug or false
+  util.debug("Starting thread")
 
   local args = _vim.mpack.decode(arg_str)
 
   local ctrl_write_pipe = util.open_fd(write_fd)
   local ctrl_read_pipe = util.open_fd(read_fd)
 
-  init_globals(ctrl_write_pipe, config_table)
+  init_globals(ctrl_write_pipe)
 
   local co = coroutine.create(function()
     local fn, err = loadstring(cb_string)
@@ -296,9 +373,9 @@ function M.run(write_fd, read_fd, cb_string, config, arg_str, arg_len)
     fn(unpack(args, 1, arg_len))
   end)
 
-  ctrl_read_pipe:read_start(get_on_control(ctrl_write_pipe, co))
+  ctrl_read_pipe:read_start(get_on_control(ctrl_write_pipe))
 
-  resume(co)
+  resume_check_err(co)
 
   uv.run()
 end

@@ -4,6 +4,10 @@ local M = {}
 
 local uv = vim.uv
 
+---@class ThreadingConfig
+---@field debug boolean?
+---@field proxy_functions boolean? Whether to run functions without return statements on the child thread (default: true)
+
 ---@alias uv_thread userdata
 
 ---@class ThreadingThread
@@ -38,7 +42,7 @@ local uv = vim.uv
 ---@class ExistingFunctionDefinition
 ---@field fn function
 ---@field refcount integer
----@field upvalue_func_ids table<integer, integer>
+---@field upvalue_func_ids table<integer, integer> used for tracking function values as upvalues
 
 ---vim key types not sent to thread because they exist in all versions
 local disabled_types = {
@@ -159,6 +163,21 @@ local function get_delete_fn_callback(thread)
   end
 end
 
+---returns a function that sends the function call to the thread
+---@param thread ThreadingThread
+---@return fun(fn: function, args: table)
+local function get_send_fn_call_callback(thread)
+  return function(id, args)
+    util.debug("Sending function call with id ", id, " and args ", args)
+
+    util.write_to_pipe(thread.ctrl_write_pipe, {
+      type = "proxy_call",
+      id = id,
+      args = args
+    })
+  end
+end
+
 ---convert from serializable format to the original format and set `thread._received_functions`
 ---@param thread ThreadingThread
 ---@param data SerializedFunction
@@ -169,7 +188,8 @@ local function from_serializable(thread, data)
     data,
     thread._received_functions,
     get_recv_fn_return_callback(thread),
-    get_delete_fn_callback(thread)
+    get_delete_fn_callback(thread),
+    get_send_fn_call_callback(thread)
   )
   return result
 end
@@ -223,18 +243,19 @@ local function get_on_control(thread)
 
           -- TODO handle errors
           if data.kind == "call" then
-            result = handle_vim_call(thread, data)
+            result = { handle_vim_call(thread, data) }
           elseif data.kind == "get" then
-            result = handle_vim_get(data)
+            result = { handle_vim_get(data) }
           elseif data.kind == "set" then
-            result = handle_vim_set(data)
+            handle_vim_set(data)
           else
             print("Unknown kind: ", data.kind)
           end
 
           util.write_to_pipe(thread.ctrl_write_pipe, {
             type = "vim_response",
-            result = result
+            result = result,
+            ___co_id = data.___co_id
           })
         end)
       elseif data.type == "delete_response" then
@@ -261,14 +282,16 @@ end
 ---@return table
 local function get_config(user_cfg)
   return vim.tbl_extend("force", {
-    vim_types = M._vim_types
+    vim_types = M._vim_types,
+    debug = false,
+    proxy_functions = true
   }, user_cfg)
 end
 
 ---start a new thread
 ---@param callback function
 ---@param args table?
----@param config table?
+---@param config ThreadingConfig?
 ---@return ThreadingThread
 function M.start(callback, args, config)
   local ctrl_to_main = uv.pipe({ nonblock = true }, { nonblock = true })

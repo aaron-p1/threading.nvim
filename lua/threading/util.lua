@@ -9,6 +9,22 @@ M.print_debug = false
 -- use native vim in thread
 local __vim = _vim or vim
 
+
+---@type table<string, string[]> bytecodes that are executed as return statements. Depends on lua version
+---Generated with get_luajit_return_bytecodes.sh
+local return_bytecodes = {
+  ["2.1"] = {
+    "\000\074", -- RET
+    "\000\073", -- RETM
+    "\000\076", -- RET1
+    "\000\067", -- CALLMT
+    "\000\068", -- CALLT
+  }
+}
+
+local lua_version = jit.version:match("%d+%.%d+")
+local current_return_bytecodes = return_bytecodes[lua_version]
+
 ---print debug message
 ---@param ... any
 ---@return nil
@@ -104,7 +120,13 @@ end
 ---@param pipe uv_pipe_t
 ---@param data any
 function M.write_to_pipe(pipe, data)
-  local data_str = __vim.mpack.encode(data)
+  local ok, data_str = pcall(__vim.mpack.encode, data)
+
+  if not ok then
+    M.debug(__vim.inspect(data))
+    error(debug.traceback(data_str))
+  end
+
   local len = #data_str
 
   pipe:write(len .. data_separator .. data_str)
@@ -167,6 +189,24 @@ function M.dechunk_pipe_msg(cb, err_cb, closing_cb)
   end
 end
 
+---checks if `fn_str` has a return statement with a value
+---@param fn_str string dumped function
+---@return boolean has_return
+function M.can_return_value(fn_str)
+  -- incompatible luajit version
+  if not current_return_bytecodes then
+    return true
+  end
+
+  for _, ret_code in ipairs(current_return_bytecodes) do
+    if string.find(fn_str, ret_code) then
+      return true
+    end
+  end
+
+  return false
+end
+
 ---returns all upvalues of a function
 ---@param fn function
 ---@return table<string, any>
@@ -222,18 +262,17 @@ end
 ---convert any type of `data` (except userdata and thread) to a serializable format
 ---TODO handle metatables
 ---@param data any
----@param id_counter? integer id to start from
----@param functions? table<integer, function> existing function mappings
+---@param id_counter integer id to start from
+---@param functions table<integer, function> existing function mappings
+---@param with_function_proxies boolean
 ---@return nil|boolean|number|string|table serializable data that can be serialized with mpack
 ---@return table<integer, function> functions mapping from ID to function for later identification
 ---@return integer max_id for setting IDs
-function M.to_serializable(data, id_counter, functions)
+function M.to_serializable(data, id_counter, functions, with_function_proxies)
   assert(type(data) ~= "userdata", "Cannot serialize userdata")
   assert(type(data) ~= "thread", "Cannot serialize coroutine thread")
 
   local dtype = type(data)
-  id_counter = id_counter or 0
-  functions = functions or {}
 
   if dtype ~= "table" and dtype ~= "function" then
     return data, functions, id_counter
@@ -241,7 +280,7 @@ function M.to_serializable(data, id_counter, functions)
     local result = {}
 
     for k, v in pairs(data) do
-      result[k], functions, id_counter = M.to_serializable(v, id_counter, functions)
+      result[k], functions, id_counter = M.to_serializable(v, id_counter, functions, with_function_proxies)
     end
 
     return result, functions, id_counter
@@ -262,18 +301,29 @@ function M.to_serializable(data, id_counter, functions)
       }, functions, id_counter
     end
 
+    local dumped_function = string.dump(data)
+
     id_counter = id_counter + 1
     local current_fn_id = id_counter
-    functions[current_fn_id] = data
+    functions[id_counter] = data
+
+    if with_function_proxies and not M.can_return_value(dumped_function) then
+      return {
+        ___serialized_type = "function_proxy",
+        id = current_fn_id
+      }, functions, id_counter
+    end
+
     local current_shared_upvalues = get_shared_upvalues(data, current_fn_id, functions)
 
     local s_upvalues
-    s_upvalues, functions, id_counter = M.to_serializable(M.get_upvalues(data), id_counter, functions)
+    s_upvalues, functions, id_counter = M.to_serializable(
+      M.get_upvalues(data), id_counter, functions, with_function_proxies)
 
     return {
       ___serialized_type = "function",
       id = current_fn_id,
-      fn = string.dump(data),
+      fn = dumped_function,
       upvalues = s_upvalues,
       shared_upvalues = current_shared_upvalues
     }, functions, id_counter
@@ -308,6 +358,7 @@ local function get_overridden_fn(id, fn, fn_cb, gc_cb)
     local result = { fn(...) }
 
     if gc_tracker then
+      -- use it but don't do anything
       gc_tracker = gc_tracker
     end
 
@@ -324,9 +375,10 @@ end
 ---@param existing_functions? table<integer, ExistingFunctionDefinition> existing function mappings
 ---@param fn_cb? fun(fn: function, id: integer) called after executing the functions in `data`
 ---@param gc_cb? fun(id: integer) called when garbage collecting a function
+---@param pr_cb? fun(id: integer, args: table) called when calling a proxied function
 ---@return nil|boolean|number|string|table|function original data
 ---@return table<integer, ExistingFunctionDefinition>
-function M.from_serializable(data, existing_functions, fn_cb, gc_cb)
+function M.from_serializable(data, existing_functions, fn_cb, gc_cb, pr_cb)
   existing_functions = existing_functions or {}
 
   if type(data) ~= "table" then
@@ -339,8 +391,7 @@ function M.from_serializable(data, existing_functions, fn_cb, gc_cb)
     local fn = loadstring(data.fn)
     assert(fn, "Failed to load function")
 
-    local overridden_fn
-    overridden_fn, existing_functions = get_overridden_fn(data.id, fn, fn_cb, gc_cb), existing_functions
+    local overridden_fn = get_overridden_fn(data.id, fn, fn_cb, gc_cb)
 
     existing_functions[data.id] = {
       fn = fn,
@@ -350,7 +401,7 @@ function M.from_serializable(data, existing_functions, fn_cb, gc_cb)
 
     for index, value in pairs(data.upvalues) do
       local orig_value
-      orig_value, existing_functions = M.from_serializable(value, existing_functions, fn_cb, gc_cb)
+      orig_value, existing_functions = M.from_serializable(value, existing_functions, fn_cb, gc_cb, pr_cb)
 
       if type(orig_value) == "function" then
         existing_functions[data.id].upvalue_func_ids[index] = value.id
@@ -369,6 +420,29 @@ function M.from_serializable(data, existing_functions, fn_cb, gc_cb)
     end
 
     return overridden_fn, existing_functions
+  elseif data.___serialized_type == "function_proxy" then
+    assert(pr_cb, "Cannot create function proxy without proxy callback")
+    local gc_tracker
+    if gc_cb then
+      gc_tracker = create_gc_tracker(gc_cb, data.id)
+    end
+
+    local overridden_fn = function(...)
+      pr_cb(data.id, { ... })
+
+      if gc_tracker then
+        -- use it but don't do anything
+        gc_tracker = gc_tracker
+      end
+    end
+
+    existing_functions[data.id] = {
+      fn = overridden_fn,
+      refcount = 1,
+      upvalue_func_ids = {}
+    }
+
+    return overridden_fn, existing_functions
   elseif data.___serialized_type == "function_ref" then
     local ex_fn = existing_functions[data.id]
     assert(ex_fn, "Could not find function with ID: " .. data.id)
@@ -380,7 +454,7 @@ function M.from_serializable(data, existing_functions, fn_cb, gc_cb)
   local result = {}
 
   for k, v in pairs(data) do
-    result[k], existing_functions = M.from_serializable(v, existing_functions, fn_cb, gc_cb)
+    result[k], existing_functions = M.from_serializable(v, existing_functions, fn_cb, gc_cb, pr_cb)
   end
 
   return result, existing_functions

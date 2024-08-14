@@ -93,8 +93,6 @@ local function tests(first, second, third)
       print("nothing tested because only one tab exists")
     end
   end)
-
-  vim.stop_thread()
 end
 
 _G.Thread = t.start(tests, { "first", nil, { test = "table" } }, { debug = tutil.print_debug })
