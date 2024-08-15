@@ -44,6 +44,12 @@ long as you do not have tens of megabytes of source files that are
 recursive functions and get sent to the main thread, you should not even
 notice it.
 
+## Limitations
+
+- not possible to run vimscript on thread
+
+(I have not tested everything yet, so there may be more limitations.)
+
 ## Additional TODO
 
 - vim function error handling
@@ -56,6 +62,10 @@ notice it.
 - mutable tables
 - make changing upvalue to a function value work
 - `mpack.encode` may fail if data is too large
+- override vim functions that should work in thread natively
+  but are not available (e.g. `vim.system()`)
+- check if pipe read function could process data in wrong order
+  (e.g. when blocking read function)
 
 ## Usage
 
@@ -79,6 +89,11 @@ local thread = t.start(function(param1, param2)
     -- (as long as it does not become a new function or userdata)
     a = a + 1
     print(a)
+
+    -- Functions with return statements with a value get executed on the main thread.
+    -- Others are executed on the child thread.
+    -- You could always check with `vim.is_thread()` where the function is executed.
+    return nil
   end)
 
   -- thread keeps running after the function is done
